@@ -1,0 +1,1075 @@
+---
+title: "Pressure Cooker complete code"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(GGally)
+library(caret)
+library(glmnet)
+```
+
+### Authors:
+#### Group 3
+Jessica Bormann 
+Sophie Elting 
+Casper van Tongeren 
+
+# Layout
+This document will consist of all data used in our pressure cooker. 
+First we will use the code provided by Steffen Greup, to set up and load the raw data files and do some minor data transformations.
+After that we will add the data of Steffen and Abe, showing us a basic first model.
+Then we will do some of our own data exploration.
+Finally we will start constructing our own models and comparing their effectiveness to generalize to new data
+
+## 1. Data loading and preparation
+```{r}
+rm(list = ls()); graphics.off()
+
+#' - in each comment blok the links refer to websites where you can download the files needed: #nolint
+#' - all variable names are in Dutch; you can rename these yourself. In your final presentation #nolint
+#'  make sure the client know about what variables your are talking in your report #nolint
+
+###########################################################################
+# Populatie en adres (location details)
+# https://duo.nl/open_onderwijsdata/databestanden/po/adressen/adressen-po-3.jsp
+# https://duo.nl/open_onderwijsdata/images/03-alle-vestigingen-bo.csv
+###########################################################################
+
+d <- readr::read_csv2("data/input/03-alle-vestigingen-bo.csv") %>%
+  janitor::clean_names()
+
+d <- d %>%
+  dplyr::select(vestigingsnummer, postcode,
+                plaatsnaam, gemeentenaam,
+                gemeentenummer, provincie)
+
+d <- d %>%
+  dplyr::mutate(brin_nummer = stringr::str_sub(vestigingsnummer, 1, 4),
+                vestigingsnummer = stringr::str_sub(vestigingsnummer, 5, -1))
+
+###########################################################################
+# Aantal leerlingen (number of students)
+# https://duo.nl/open_onderwijsdata/databestanden/po/leerlingen-po/po-totaal/leerlingen-po-6.jsp #nolint
+# https://duo.nl/open_onderwijsdata/images/06-historische-data-leerlingaantallen-po.xlsx #nolint
+###########################################################################
+
+d_n_lln <- readr::read_csv2("data/input/06-historische-data-leerlingaantallen-po.csv", #nolint
+                            guess_max = 10000) %>%
+                            janitor::clean_names()
+
+d_n_lln <- d_n_lln %>%
+  dplyr::select(brin_nummer, vestigingsnummer,
+                type_po, dplyr::starts_with("leerlingen_")) %>%
+  dplyr::filter(type_po == "BO") %>%
+  dplyr::select(-type_po)
+
+d_n_lln <- d_n_lln %>%
+  tidyr::pivot_longer(cols = dplyr::starts_with("leerlingen_"),
+                      names_to = "jaar",
+                      values_to = "aantal_leerlingen",
+                      names_prefix = "leerlingen_") %>%
+  dplyr::mutate(jaar = as.integer(jaar),
+                schooljaar = paste(jaar, jaar + 1, sep = "-"))
+
+###########################################################################
+# Toetsresultaten, gemeten in behaalde referentieniveaus (test results)
+# https://duo.nl/open_onderwijsdata/databestanden/po/leerlingen-po/bo-sbo/refniveau.jsp #nolint
+# https://duo.nl/open_onderwijsdata/images/10-leerlingen-bo-referentieniveaus-2018-2019.csv #nolint
+# https://duo.nl/open_onderwijsdata/images/10-leerlingen-bo-referentieniveaus-2017-2018.csv #nolint
+# https://duo.nl/open_onderwijsdata/images/10-leerlingen-bo-referentieniveaus-2016-2017.csv #nolint
+# https://duo.nl/open_onderwijsdata/images/10-leerlingen-bo-referentieniveaus-2015-2016.csv #nolint
+###########################################################################
+
+d_toets <- list.files("data/input/referentieniveaus/",
+                      full.names = TRUE, pattern = ".csv") %>%
+  lapply(., FUN = readr::read_csv2,
+         col_types = cols(VESTIGINGSNUMMER = col_character())) %>%
+  dplyr::bind_rows() %>%
+  janitor::clean_names()
+
+d_toets <- d_toets %>%
+  dplyr::mutate(vestigingsnummer = stringr::str_pad(vestigingsnummer,
+                                                    width = 2, side = "left", pad = "0")) #nolint
+
+d_toets <- d_toets %>%
+  dplyr::select(peildatum, brin_nummer,
+                vestigingsnummer,
+                dplyr::ends_with("1f"),
+                dplyr::ends_with("2f"), rekenen_1s) %>%
+  dplyr::mutate(rekenen_2f = rekenen_1s + rekenen_2f) %>%
+  dplyr::select(-rekenen_1s) %>%
+  dplyr::mutate(peiljaar = as.integer(stringr::str_sub(as.character(peildatum), 1, 4)), #nolint
+                schooljaar = paste(peiljaar - 1, peiljaar, sep = "-")) %>%
+  dplyr::select(-peildatum, -peiljaar)
+
+d_toets <- d_toets %>%
+  dplyr::mutate(n_observaties = rekenen_lager1f + rekenen_1f
+                                + rekenen_2f + lv_lager1f
+                                + lv_1f + lv_2f + tv_lager1f
+                                + tv_1f + tv_2f)
+
+d_toets <- d_toets %>%
+  dplyr::mutate(perc_2F = 100 * (rekenen_2f + lv_2f + tv_2f) / n_observaties)
+
+d_toets <- d_toets %>%
+  dplyr::select(brin_nummer, vestigingsnummer,
+                schooljaar, n_observaties, perc_2F)
+
+###########################################################################
+# Schoolweging toevoegen (what does this mean?)
+#
+# https://www.cbs.nl/nl-nl/maatwerk/2018/46/gemiddelde-verwachte-schoolscores-2015-2017 #nolint
+# https://www.cbs.nl/-/media/_excel/2018/46/181109-gemiddelde-verwachte-schoolscores-def.xlsx #nolint
+#
+# https://www.cbs.nl/nl-nl/maatwerk/2021/12/schoolweging-2018-2020
+# https://www.cbs.nl/-/media/_excel/2021/12/schoolweging-2018-2020.xlsx
+###########################################################################
+
+d_weging_2015 <- readxl::read_xlsx("data/input/181109 Gemiddelde verwachte schoolscores-def.xlsx", #nolint
+                                   sheet = "Tabel 1", skip = 3) %>%
+  janitor::clean_names() %>%
+  dplyr::mutate(schooljaar = "2015-2016") %>%
+  dplyr::rename(schoolweging = gemiddelde_score)
+
+d_weging_2016 <- readxl::read_xlsx("data/input/181109 Gemiddelde verwachte schoolscores-def.xlsx", #nolint
+                                   sheet = "Tabel 2", skip = 3) %>%
+  janitor::clean_names() %>%
+  dplyr::mutate(schooljaar = "2016-2017") %>%
+  dplyr::rename(schoolweging = gemiddelde_score)
+
+d_weging_2017 <- readxl::read_xlsx("data/input/181109 Gemiddelde verwachte schoolscores-def.xlsx", #nolint
+                                   sheet = "Tabel 3", skip = 3) %>%
+  janitor::clean_names() %>%
+  dplyr::mutate(schooljaar = "2017-2018") %>%
+  dplyr::rename(schoolweging = gemiddelde_score)
+
+d_weging_2018 <- readxl::read_xlsx("data/input/schoolweging-2018-2020.xlsx",
+                                   sheet = "Tabel 1", skip = 3) %>%
+  janitor::clean_names() %>%
+  dplyr::mutate(schooljaar = "2018-2019")
+
+d_weging_2019 <- readxl::read_xlsx("data/input/schoolweging-2018-2020.xlsx",
+                                   sheet = "Tabel 2", skip = 3) %>%
+  janitor::clean_names() %>%
+  dplyr::mutate(schooljaar = "2019-2020")
+
+d_weging_2020 <- readxl::read_xlsx("data/input/schoolweging-2018-2020.xlsx",
+                                   sheet = "Tabel 3", skip = 3) %>%
+  janitor::clean_names() %>%
+  dplyr::mutate(schooljaar = "2020-2021")
+
+d_weging <- dplyr::bind_rows(d_weging_2015, d_weging_2016, d_weging_2017,
+                             d_weging_2018, d_weging_2019, d_weging_2020) %>%
+  dplyr::select(brin, vestiging, schooljaar,
+                schoolweging, schoolweging_spreiding = spreiding) %>%
+  tidyr::drop_na(brin)
+
+rm(d_weging_2015, d_weging_2016, d_weging_2017,
+   d_weging_2018, d_weging_2019, d_weging_2020)
+
+d_weging <- d_weging %>%
+  dplyr::rename(brin_nummer = brin,
+                vestigingsnummer = vestiging)
+
+###########################################################################
+# Add open data from CBS, based on postalcodes
+###########################################################################
+
+library(cbsodataR)
+
+# all_tables <- cbs_get_toc() #nolint
+#
+# kerncijfers <- all_tables %>%
+# dplyr::filter(stringr::str_detect(ShortTitle, pattern = 'Kerncijfers')) #nolint
+
+if (isFALSE(file.exists("data/input/cbs_open_data.rds"))) {
+
+  vraag_cbs_data_op <- function(tabelnummer, jaar) {
+
+    x <- cbs_get_data(tabelnummer, select = c("SoortRegio_2",
+                                              "Codering_3",
+                                              "AantalInwoners_5",
+                                              "k_0Tot15Jaar_8",
+                                              "Bevolkingsdichtheid_33"))
+
+    x <- x %>%
+      dplyr::mutate(dplyr::across(where(is.character), stringr::str_squish)) %>%
+      dplyr::filter(SoortRegio_2 == "Gemeente") %>%
+      dplyr::select(-SoortRegio_2) %>%
+      dplyr::mutate(jaar = jaar)
+
+    return(x)
+
+  }
+
+  d_cbs <- mapply(FUN = vraag_cbs_data_op,
+                  tabelnummer = c("83487NED", "83765NED", "84286NED",
+                                  "84583NED", "84799NED", "85039NED"),
+                  jaar = 2016:2021,
+                  SIMPLIFY = FALSE) %>%
+    dplyr::bind_rows()
+
+  saveRDS(d_cbs, "data/input/cbs_open_data.rds")
+
+} else {
+
+  d_cbs <- readRDS("data/input/cbs_open_data.rds")
+
+}
+
+d_cbs <- d_cbs %>%
+  dplyr::rename(gemeentenummer                     = Codering_3,
+                gemeente_aantal_inwoners           = AantalInwoners_5,
+                gemeente_aantal_inwoners_0_15_jaar = k_0Tot15Jaar_8,
+                gemeente_bevolkingsdichtheid       = Bevolkingsdichtheid_33)
+
+d_cbs <- d_cbs %>%
+  dplyr::mutate(gemeentenummer = stringr::str_sub(gemeentenummer, 3, -1),
+                gemeente_perc_inwoners_0_tot_15_jaar = 100 * gemeente_aantal_inwoners_0_15_jaar / gemeente_aantal_inwoners, #nolint
+                schooljaar = paste(jaar - 1, jaar, sep = "-")) %>%
+  dplyr::select(gemeentenummer, schooljaar, gemeente_aantal_inwoners,
+                gemeente_perc_inwoners_0_tot_15_jaar,
+                gemeente_bevolkingsdichtheid)
+
+###########################################################################
+# Personeel (staff)
+###########################################################################
+
+#############################
+# More features
+# https://duo.nl/open_onderwijsdata/databestanden/po/onderwijspersoneel/po-personeel2.jsp #nolint
+# https://duo.nl/open_onderwijsdata/images/02-onderwijspersoneel-po-in-fte-2011-2020.xlsx #nolint
+#############################
+
+d_personeel <- readxl::read_xlsx("data/input/02-onderwijspersoneel-po-in-fte-2011-2020.xlsx", #nolint
+                                 sheet = "per owtype-bestuur-brin-functie") %>%
+  janitor::clean_names() %>%
+  dplyr::select(-onderwijstype, -bevoegd_gezag)
+
+d_personeel <- d_personeel %>%
+  dplyr::mutate(functiegroep = dplyr::case_when(
+    functiegroep == "Directie" ~ "dir",
+    functiegroep == "Leraren in opleiding (LIO)" ~ "lio",
+    functiegroep == "Onbekend" ~ "onbekend",
+    functiegroep == "Onderwijsgevend personeel" ~ "op",
+    functiegroep == "Onderwijsondersteunend personeel (OOP/OBP)" ~ "oop_obp",
+  ))
+
+# wanneer er geen data is staat er bij de gemiddeldes 0 ipv een missing
+d_personeel <- d_personeel %>%
+  dplyr::mutate(across(dplyr::starts_with("gemiddelde_"),
+                       ~ifelse(. == 0, yes = NA_real_, no = .)))
+
+d_personeel <- d_personeel %>%
+  dplyr::filter(stringr::str_to_lower(brin_nummer) != "bovenschools")
+
+d_personeel <- d_personeel %>%
+  tidyr::pivot_longer(cols = -c(brin_nummer, functiegroep),
+                      names_to = "variabele_en_jaar",
+                      values_to = "waarde") %>%
+  dplyr::mutate(jaar      = stringr::str_sub(variabele_en_jaar,
+                                             start = -4, end = -1),
+                jaar      = as.integer(jaar),
+                variabele = stringr::str_sub(variabele_en_jaar,
+                                             start = 1, end = -6)) %>%
+  dplyr::select(-variabele_en_jaar)
+
+d_personeel <- d_personeel %>%
+  tidyr::pivot_wider(names_from = variabele,
+                     values_from = waarde)
+
+d_personeel_a <- d_personeel %>%
+  dplyr::filter(functiegroep == "op") %>%
+  dplyr::mutate(perc_man = 100 * ftes_mannen / ftes,
+                perc_tijdelijk_contract = 100 * ftes_personen_in_tijdelijke_dienst / ftes) %>% #nolint
+  dplyr::select(brin_nummer, jaar, ftes,
+                gemiddelde_aanstelling = gemiddelde_ftes,
+                gemiddelde_leeftijd, perc_man, perc_tijdelijk_contract)
+
+# gemiddelde_ftes, # gemiddelde_leeftijd
+
+d_personeel_b <- d_personeel %>%
+  dplyr::filter(functiegroep == "oop_obp") %>%
+  dplyr::select(brin_nummer, jaar, ftes_ondersteunend = ftes)
+
+d_personeel_tot <- d_personeel_a %>%
+  dplyr::left_join(d_personeel_b, by = c("brin_nummer", "jaar")) %>%
+  dplyr::mutate(ratio_leraar_ondersteuner = ftes / ftes_ondersteunend,
+                schooljaar = paste(jaar, jaar + 1, sep = "-")) %>%
+  dplyr::select(-ftes, -ftes_ondersteunend, -jaar)
+
+rm(d_personeel_a, d_personeel_b)
+
+#############################
+# leerling-leraar ratio's
+# (teacher-student ratio)
+# https://duo.nl/open_onderwijsdata/databestanden/po/onderwijspersoneel/po-personeel3.jsp #nolint
+# https://duo.nl/open_onderwijsdata/images/03-leerling-leraarratio-po-per-instelling.xlsx #nolint
+#############################
+
+d_leraar_leerling <- readxl::read_xlsx("data/input/03-leerling-leraarratio-po-per-instelling.xlsx", #nolint
+                                       sheet = "7. ratios-regio-bestuur-brin") %>% #nolint
+  janitor::clean_names()
+
+d_leraar_leerling <- d_leraar_leerling %>%
+  dplyr::filter(o == "BAO") %>%
+  dplyr::select(brin_nummer = brin, dplyr::starts_with("ratio_"))
+
+d_leraar_leerling <- d_leraar_leerling %>%
+  tidyr::pivot_longer(cols = dplyr::starts_with("ratio_"),
+                      names_to = "jaar",
+                      values_to = "ratio_leerling_leraar",
+                      names_prefix = "ratio_") %>%
+  dplyr::mutate(jaar = as.integer(jaar),
+                schooljaar = paste(jaar, jaar + 1, sep = "-")) %>%
+  dplyr::select(-jaar)
+
+###################
+# Combineren (combine data)
+# Ik beperk de dataset nu tot de jaren waar ook de toetsresultaten beschikbaar zijn #nolint
+# (this join makes a subset of data based on availability in d_toets)
+# Sommige databronnen hebben ook oudere gegevens, die worden nu dus niet meegenomen. #nolint
+###################
+
+d_tot <- d_toets %>%
+  dplyr::left_join(d,                 by = c("brin_nummer", "vestigingsnummer")) %>% #nolint
+  dplyr::left_join(d_cbs,             by = c("gemeentenummer", "schooljaar")) %>% #nolint
+  dplyr::left_join(d_leraar_leerling, by = c("brin_nummer", "schooljaar")) %>% #nolint
+  dplyr::left_join(d_personeel_tot,   by = c("brin_nummer", "schooljaar")) %>% #nolint
+  dplyr::left_join(d_n_lln,           by = c("brin_nummer", "vestigingsnummer", "schooljaar")) %>% #nolint
+  dplyr::left_join(d_weging,          by = c("brin_nummer", "vestigingsnummer", "schooljaar")) #nolint
+```
+
+### Simple example model
+Now that all the data is loaded and a combined dataframe is made, we can start to build a very simple model. Here, an example by Steffen is provided:
+```{r}
+#############################
+# Voorbeeldmodelletje om uitkomstvariabele en correctie
+# voor leerlingpopulatie (schoolweging) te laten zien
+# (play model provided by the client)
+#############################
+
+d_tot <- d_tot %>%
+  dplyr::mutate(prop_2F = perc_2F / 100)
+
+mod1 <- glm(prop_2F ~ scale(schoolweging),
+            weights = n_observaties,
+            family  = binomial(),
+            data    = d_tot)
+
+predict(mod1, newdata = tibble(schoolweging = c(25, 35)), type = "response")
+```
+
+## 2. Further data prep and more advanced models
+Up next we use play code 1, also provided by Steffen. This code shows an example of how to make a model that uses differences in Perc_2F as an outcome variable for a model using various predictors
+```{r}
+# ------------------------------------------
+# play code to get you started
+# needed opbjects:
+# - d_toets should be available in the workspace after running make_dataset.
+# - d_personeel_tot should be available in the workspace after running make_dataset. #nolint
+# [it might be that this is not the best way to prepare your dataset!]
+
+# here I reshape to wide format and calculate three diff variables:
+tmp_file <- d_toets %>%
+  select(-n_observaties) %>%
+  pivot_wider(names_from = schooljaar, values_from =  perc_2F) %>%
+  mutate(diff1 = `2016-2017` - `2015-2016`,
+         diff2 = `2017-2018` - `2016-2017`,
+         diff3 = `2018-2019` - `2017-2018`)
+
+# some quick inspections; look very normal so lets do some linear modelling
+tmp_file %>%
+  select(diff1, diff2, diff3) %>%
+  ggpairs(aes(alpha = .1))
+
+# first model
+# is the growth related to the scores on 20217-2018?
+# if yes and negative effect, this could indicate regr towards the mean.
+mod <- lm(diff3 ~ scale(`2017-2018`), data = tmp_file) # regr towards the mean!
+summary(mod)
+
+# now add some more data:
+tmp_file <- d_personeel_tot %>%
+  filter(schooljaar == "2017-2018") %>%
+  right_join(tmp_file, by = c("brin_nummer"))
+
+# now add some more data:
+tmp_file <- d_weging %>%
+  filter(schooljaar == "2017-2018") %>%
+  right_join(tmp_file, by = c("brin_nummer", "vestigingsnummer"))
+
+# extend the model
+mod <- lm(diff3 ~ 1
+          + scale(`2017-2018`)
+          + scale(schoolweging)
+          + scale(perc_man)
+          + scale(gemiddelde_aanstelling)
+          + scale(perc_tijdelijk_contract)
+          , data = tmp_file) # regr towards the mean
+summary(mod)
+
+# model selection:
+
+mod_step <- step(mod)
+summary(mod_step)
+```
+
+### example by Abe
+Next up, we show the example provided by Abe. This model corrects for the effect of schoolweging, when predicting the difference in Perc_2f scores.
+```{r}
+# --------------------------------------------------------
+# play model 2.0 [after client interview]
+# predict change in 2016-2017 to 2017-2018
+# corrected for schoolweging
+# including the score at 2016-2017; to model the regr. towards the mean.
+
+tmp_file_2 <- d_weging %>%
+  rename("schoolweging_2016_2017" = "schoolweging") %>%
+  filter(schooljaar == "2017-2018") %>%
+  right_join(tmp_file, by = c("brin_nummer", "vestigingsnummer")) %>%
+  rename("schoolweging_2017_2018" = "schoolweging")
+
+# missing data issues..
+
+tmp_file_clean <- tmp_file_2 %>%
+  filter(!is.na(`2016-2017`),
+         !is.na(`2017-2018`),
+         !is.na(schoolweging_2016_2017),
+         !is.na(schoolweging_2017_2018))
+
+mod <- lm(`2016-2017` ~ 1 + schoolweging_2016_2017, data = tmp_file_clean)
+tmp_file_clean$res_2016_2017 <- residuals(mod)
+
+mod <- lm(`2017-2018` ~ 1 + schoolweging_2017_2018, data = tmp_file_clean)
+tmp_file_clean$res_2017_2018 <- residuals(mod)
+
+tmp_file_clean$diff_corrected_3 <- tmp_file_clean$res_2017_2018 - tmp_file_clean$res_2016_2017 #nolint
+
+# extend the model
+mod <- lm(diff_corrected_3 ~ 1
+          + scale(res_2016_2017)
+          # + scale(schoolweging) #nolint
+          + scale(perc_man)
+          + scale(gemiddelde_aanstelling)
+          + scale(perc_tijdelijk_contract)
+          , data = tmp_file_clean) # regr towards the mean
+summary(mod)
+summary(step(mod))
+```
+
+## 3. Data exploration
+Then, for our first look at the data we did some data exploration. Here we looked at anomalies in the data, as well as distributions and other points of interest that we may use in making our models later on.
+
+We inspect the total dataset d_tot
+```{r}
+head(d_tot)
+```
+
+Next we want to make sure that all the variables are of the correct datatype and if not, we should change that
+```{r}
+lapply(d_tot, class)
+```
+
+We notice that "aantal leerlingen" is a character variable, while it should be numeric. We transform this:
+```{r}
+length(which(is.na(d_tot$aantal_leerlingen)))
+length(which(is.na(as.numeric(d_tot$aantal_leerlingen))))
+# one NA is added when transforming to numeric
+
+d_tot <- d_tot %>%
+  mutate(aantal_leerlingen = as.numeric(aantal_leerlingen))
+
+class(d_tot$aantal_leerlingen)
+```
+
+Up next, we tackle the issue of missing data. In this dataset there are 2 types of missing or wrong data. The first is NA data (missing values), the second is Inf data (which can occur when calculating a proportion and having to divide by 0).
+```{r}
+# Number of observations
+nrow(d_tot)
+```
+
+```{r}
+# remove NAs
+d_tot <- d_tot %>%
+  drop_na()
+
+# Number of observations after removing NAs
+nrow(d_tot)
+```
+
+For some further exploration of data we look at some of our variables and their distributions
+```{r}
+d_tot %>% count(vestigingsnummer)
+d_tot %>% count(schooljaar)
+d_tot %>% select(perc_2F) %>% summary()
+d_tot %>% select(schoolweging) %>% summary()
+```
+
+Now that we have a better understanding of the data, we will be taking a look at some of the distributions. Maybe we can already see if there are any high correlations or remarkable distributions among the quantitative variables
+```{r}
+d_tot %>% select(perc_2F, n_observaties, perc_man, aantal_leerlingen,
+                 ratio_leraar_ondersteuner, ratio_leerling_leraar,
+                 gemeente_perc_inwoners_0_tot_15_jaar,
+                 schoolweging_spreiding, gemiddelde_aanstelling) %>%
+  ggpairs(aes(alpha = .1))
+```
+
+Now we look at the individual distributions of the quantitative variables.
+We start with the normally distributed variables:
+```{r}
+d_tot %>% ggplot(aes(prop_2F)) + geom_density()
+d_tot %>% ggplot(aes(schoolweging)) + geom_density()
+d_tot %>% ggplot(aes(schoolweging_spreiding)) + geom_density()
+d_tot %>% ggplot(aes(ratio_leerling_leraar)) + geom_density()
+d_tot %>% ggplot(aes(gemiddelde_aanstelling)) + geom_density()
+d_tot %>% ggplot(aes(gemiddelde_leeftijd)) + geom_density()
+d_tot %>% ggplot(aes(aantal_leerlingen)) + geom_density()
+d_tot %>% ggplot(aes(gemeente_perc_inwoners_0_tot_15_jaar)) + geom_density()
+```
+
+There were also a few variables that weren't normally distributed, these are plotted below:
+```{r}
+d_tot %>% ggplot(aes(perc_man)) + geom_density()
+d_tot %>% ggplot(aes(perc_tijdelijk_contract)) + geom_density()
+d_tot %>% ggplot(aes(ratio_leraar_ondersteuner)) + geom_density()
+d_tot %>% ggplot(aes(gemeente_aantal_inwoners)) + geom_density() # transform
+d_tot %>% ggplot(aes(gemeente_bevolkingsdichtheid)) + geom_density() #transform
+```
+
+## 4. Model fitting
+
+The first thing we noticed when looking at Abe's data is that he used diff3_corrected to make a calculation for the year which corresponds with diff2. So we corrected this when making the dataframe for the year 2017-2018. 
+We then do some more transformations to make our final training data.
+
+```{r}
+tmp_file_clean$diff_corrected_2 <- tmp_file_clean$res_2017_2018 -
+  tmp_file_clean$res_2016_2017
+
+df_train <- tmp_file_clean %>%
+  select(- diff_corrected_3)
+
+# Train data frame
+df_train <- df_train %>%
+  select(brin_nummer, vestigingsnummer, `2015-2016`, `2016-2017`, `2017-2018`,
+         `2018-2019`, diff1, diff2, diff3, res_2016_2017, res_2017_2018,
+         diff_corrected_2)
+
+train_tot <- d_tot %>%
+  filter(schooljaar == "2017-2018") %>%
+  left_join(df_train, by = c("brin_nummer", "vestigingsnummer")) %>%
+  mutate(aantal_leerlingen = as.numeric(aantal_leerlingen))
+
+train_tot <- train_tot[complete.cases(train_tot), ]
+
+train_tot <- train_tot  %>%
+  rename("y2015_2016" = "2015-2016",
+         "y2016_2017" = "2016-2017",
+         "y2017_2018" = "2017-2018",
+         "y2018_2019" = "2018-2019") %>%
+  mutate_if(is.numeric, ~ifelse(abs(.) == Inf, 0, .)) %>%
+  mutate_if(is.numeric, ~ifelse(abs(.) == -Inf, 0, .))
+```
+
+To create the test data, we essentially create the same data frame as the one made above (by Abe), but this time looking at data from 2018-2019:
+```{r}
+# now add some more data:
+test_data <- d_personeel_tot %>%
+  filter(schooljaar == "2018-2019") %>%
+  right_join(tmp_file, by = c("brin_nummer"))
+
+# now add some more data:
+test_data <- d_weging %>%
+  filter(schooljaar == "2018-2019") %>%
+  right_join(tmp_file, by = c("brin_nummer", "vestigingsnummer"))
+
+test_data <- d_weging %>%
+  rename("schoolweging_2017_2018" = "schoolweging") %>%
+  filter(schooljaar == "2018-2019") %>%
+  right_join(tmp_file, by = c("brin_nummer", "vestigingsnummer")) %>%
+  rename("schoolweging_2018_2019" = "schoolweging")
+
+# missing data issues..
+clean_test_data <- test_data %>%
+  filter(!is.na(`2017-2018`),
+         !is.na(`2018-2019`),
+         !is.na(schoolweging_2017_2018),
+         !is.na(schoolweging_2018_2019))
+
+mod <- lm(`2017-2018` ~ 1 + schoolweging_2017_2018, data = clean_test_data)
+clean_test_data$res_2017_2018 <- residuals(mod)
+
+mod <- lm(`2018-2019` ~ 1 + schoolweging_2018_2019, data = clean_test_data)
+clean_test_data$res_2018_2019 <- residuals(mod)
+
+clean_test_data$diff_corrected_3 <- clean_test_data$res_2018_2019 -
+  clean_test_data$res_2017_2018
+
+df_test <- clean_test_data %>%
+  select(brin_nummer, vestigingsnummer, `2015-2016`, `2016-2017`, `2017-2018`,
+         `2018-2019`, diff1, diff2, diff3, res_2017_2018, res_2018_2019,
+         diff_corrected_3)
+
+test_tot <- d_tot %>%
+  filter(schooljaar == "2018-2019") %>%
+  left_join(df_test, by = c("brin_nummer", "vestigingsnummer")) %>%
+  mutate(aantal_leerlingen = as.numeric(aantal_leerlingen))
+
+test_tot <- test_tot[complete.cases(test_tot), ]
+
+test_tot <- test_tot  %>%
+  rename("y2015_2016" = "2015-2016",
+         "y2016_2017" = "2016-2017",
+         "y2017_2018" = "2017-2018",
+         "y2018_2019" = "2018-2019") %>%
+  mutate_if(is.numeric, ~ifelse(abs(.) == Inf, 0, .)) %>%
+  mutate_if(is.numeric, ~ifelse(abs(.) == -Inf, 0, .))
+```
+
+Now that we have our training data and our test data, we will see if we need to delete any columns due to a variance of nearly 0.
+
+```{r}
+getNearZeroVariationPredictors <- function(df) {
+
+  nzv_predictors <- df %>%
+    nearZeroVar(names = TRUE)
+
+  if (length(nzv_predictors) == 0) {
+    return(0L)
+  } else {
+    return(nzv_predictors)
+  }
+}
+
+nzv_train <- getNearZeroVariationPredictors(train_tot)
+nzv_train
+```
+
+It appears there are some variables which we should delete. However, these are not variables we intend to use in our models. So we choose to ignore the outcome here. Next, we look at highly correlated columns.
+
+```{r}
+high_cor <- train_tot %>%
+    select(-c(brin_nummer, vestigingsnummer, schooljaar, postcode,
+              plaatsnaam, gemeentenaam, provincie, jaar, gemeentenummer)) %>%
+    cor() %>%
+    findCorrelation(.9, names = TRUE)
+  
+high_cor
+```
+
+We now make a dataframe which we can use to create our models. First the test data (from 2017-2018).
+```{r}
+train_model <- train_tot %>%
+  select(-c(brin_nummer, vestigingsnummer, schooljaar, postcode,
+            plaatsnaam, gemeentenaam, provincie, jaar, gemeentenummer,
+            diff2, diff3,
+            # remove variables with high correlation
+            perc_2F, y2015_2016,
+            # these predictors make the r-squared 1
+            y2017_2018, y2018_2019, y2016_2017,
+            res_2016_2017, res_2017_2018))
+
+colnames(train_model)
+```
+
+As well as the test data from 2018-2019. We rename diff2 to diff1 so it matches the column names of the training data. But we know it to be diff2.
+```{r}
+test_model <- test_tot %>%
+  select(-c(brin_nummer, vestigingsnummer, schooljaar, postcode,
+            plaatsnaam, gemeentenaam, provincie, jaar, gemeentenummer,
+            diff1, diff3,
+            # remove variables with high correlation
+            perc_2F, y2015_2016,
+            # these predictors make the r-squared 1
+            y2017_2018, y2018_2019, y2016_2017,
+            res_2017_2018, res_2018_2019)) %>%
+  rename("diff1" = "diff2")
+
+colnames(test_model)
+```
+
+## Linear model
+For our linear model we will be using a forward stepwise approach. We first define a nullmodel and a full model.
+```{r}
+nullmod <- lm(diff_corrected_2 ~ 1, data = train_model)
+fullmod <- lm(diff_corrected_2 ~., data = train_model)
+summary(fullmod)
+```
+
+Then we use the step function to obtain the best model.
+```{r}
+finalmod <- MASS::stepAIC(nullmod,
+                              scope = list(upper = fullmod),
+                              direction = "forward", trace = FALSE)
+
+finalmod
+summary(finalmod)
+```
+
+We Use this model to predict the test data and obtain the RMSE. We also plot the predicted data and the observed data.
+```{r}
+pred_lm <- predict(finalmod, newdata = test_model)
+
+RMSE_lm <- RMSE(pred = pred_lm, obs = test_model$diff_corrected_3)
+RMSE_lm
+
+tibble(pred_lm = pred_lm, diff_corrected_3 = test_model$diff_corrected_3) %>%
+  ggplot(aes(x = pred_lm, y = diff_corrected_3)) +
+  geom_point(alpha = .2) +
+  geom_abline() +
+  labs(title = "Predictions vs Observations", y = "Corrected Difference of
+       Observations (2018/2019 - 2017/2018)", x = "LM Predictions",
+       subtitle = "Using data to predict 1 year into the future",
+       caption = "Data Source: Inspectorate of Education") +
+  theme_minimal() +
+    geom_text(x = 30, y = -30, size = 4,
+    label = paste("RMSE = ", round(RMSE_lm, 3)))
+```
+
+## Assumption check
+
+```{r}
+fit <- finalmod
+```
+
+1. A linear relationship between the dependent and independent variables
+
+* expected values of prediction errors is 0 for all i: E(ε|x1,…,xp) = 0
+
+```{r}
+plot(fit, which = 1) # should be red straight line at 0
+res <- lmtest::resettest(fit) # if significant --> assumption violated
+res
+round(res$statistic, 5)
+round(res$p.value, 5)
+```
+
+2. The independent variables are not highly correlated with each other
+
+* we removed highly correlated predictors
+
+
+3. The variance of the residuals is constant
+
+* Homoscedasticity of the residuals (that is all ε have the same variance).
+
+```{r}
+plot(fit, which = 3) # scale-location plot -> should be red straight line at 1
+ncv <- car::ncvTest(fit) # if significant --> assumption violated
+ncv
+round(ncv$ChiSquare, 5)
+round(ncv$p, 5)
+```
+
+
+4. The residuals are follow a normal distribution
+
+* we cannot do the shapiro test because it requires a sample size between 3 and
+5000
+
+```{r}
+plot(fit, which = 2)
+#shp <- shapiro.test(resid(fit)) # if significant assumption is violated
+```
+
+
+6. Multivariate normality
+
+```{r}
+round(car::vif(fit), 5) # > 10 suspicious
+```
+
+
+## Outliers
+
+### in IV space
+
+```{r}
+plot(fit, which = 5) # Residuals vs Leverage plot
+abline(v = 2 * mean(hatvalues(fit)), col = 3, lty = 3) 
+sum(hatvalues(fit) > 2 * mean(hatvalues(fit))) 
+outliers_iv_index <- which(hatvalues(fit) > 2 * mean(hatvalues(fit))) 
+```
+
+
+### in DV space
+
+```{r}
+sum(abs(rstandard(fit)) > 2)
+outliers_dv_index <- which(abs(rstandard(fit)) > 2)
+```
+
+
+### both: cooks distance
+
+```{r}
+sum(cooks.distance(fit) > 0.5)
+```
+
+
+Fit model with outliers removed and compare it with the original model.
+
+```{r}
+outliers_removed <- train_model[-c(outliers_iv_index, outliers_dv_index),]
+fit_outliers_removed <- lm(diff_corrected_2 ~., data = outliers_removed)
+summary(fit_outliers_removed)
+```
+
+
+### Lasso model
+We now look at a less flexible model, the lasso regression.
+Before we make a lasso model, we need to create an X matrix and a y outcome vector.
+```{r}
+## Train data
+y <- train_model$diff_corrected_2
+X <- train_model %>%
+  select(- diff_corrected_2) %>%
+  as.matrix()
+
+## Test data
+y_test <- test_model$diff_corrected_3
+X_test <- test_model %>%
+  select(- diff_corrected_3) %>%
+  as.matrix()
+```
+
+
+```{r}
+lasso_fit <- cv.glmnet(X, y,
+                    family = "gaussian", trace.it = 1, nfolds = 5,
+                    intercept = F, alpha = 1)
+
+print(lasso_fit)
+```
+
+We use this model to predict the test set and calculate the RMSE. We also added a plot of the predicted and observed scores.
+```{r}
+pred_lasso <- predict(lasso_fit, newx = X_test, s = "lambda.min")
+
+
+RMSE_lasso <- RMSE(pred = pred_lasso, obs = y_test)
+RMSE_lasso
+
+
+plot(pred_lasso, y_test)
+abline(0, 1)
+```
+
+### Ridge regression model
+
+Lastly we look at fitting a ridge model. It is similar to a lasso regression, with the difference being in the alpha constraint. 
+```{r}
+ridge_fit <- cv.glmnet(X, y,
+                    family = "gaussian", trace.it = 1, nfolds = 5,
+                    alpha = 0, intercept = F)
+
+print(ridge_fit)
+```
+
+We use this model to predict the test data of 2018-2019. We also calculate the RMSE and plot the predicted scores and observerd scores.
+```{r}
+pred_ridge <- predict(ridge_fit, X_test)
+
+
+RMSE_ridge <- RMSE(pred = pred_ridge, obs = y_test)
+RMSE_ridge
+
+plot(pred_ridge, y_test)
+abline(0, 1)
+```
+
+### Classification tree
+
+We also fit a classification tree. This is a model that is more flexible than an lm model.
+```{r}
+trCntrl <- trainControl("cv", 5, allowParallel = TRUE)
+
+fit_tree <- caret::train(x = X, y = y, method = "rpart", trControl = trCntrl)
+fit_tree
+```
+
+We now fit this tree model to the test data.
+```{r}
+pred_tree <- predict(fit_tree, newdata = X_test)
+
+RMSE_tree <- RMSE(pred = pred_tree, obs = y_test)
+RMSE_tree
+
+plot(pred_tree, y_test)
+abline(0, 1)
+```
+
+### Random forest
+
+We now look at a different classification model: The random forest. Here we have to specify some parameters. For the mtry parameter we use the recommended amount, the sqrt() of the number of columns of the dataframe. For splitrule we use variance and minimal node size we set to 1.
+```{r}
+mtry_ncol <- sqrt(ncol(X))
+
+## Fit Random forrest using Caret::Train
+fit_rf <- train(X, y, method = "ranger",
+    trControl = trCntrl,
+    tuneGrid = expand.grid(mtry = mtry_ncol,
+                           splitrule = "variance", min.node.size = 1)
+)
+fit_rf$finalModel
+```
+
+We use this model to predict and calculate the RMSE. We then show the prediction accuracy in a plot.
+```{r}
+pred_rf <- predict(fit_rf, newdata = X_test)
+
+RMSE_rf <- RMSE(pred = pred_rf, obs = y_test)
+RMSE_rf
+
+plot(pred_rf, y_test)
+abline(0, 1)
+```
+
+Now that we have our various models, it is time to compare. We will be looking to see which of the models has the lowest RMSE - indicating the best predictions on the data from a year later.
+```{r}
+RMSE_df <- data.frame(models = c("lm", "lasso",
+                                 "ridge", "decision tree", "random forest"),
+           RMSE = c(RMSE_lm, RMSE_lasso, RMSE_ridge, RMSE_tree, RMSE_rf))
+
+RMSE_df <- RMSE_df %>%
+  mutate(min = min(RMSE) == RMSE)
+
+## Plot showing best performance
+RMSE_df %>%
+  arrange(RMSE) %>%
+  ggplot(aes(x = models, y = RMSE, fill = min)) +
+    geom_bar(stat = "identity", show.legend = FALSE) +
+    labs(y = "RMSE",
+         x = "",
+         title = "Model comparison of test prediction accuracy",
+         subtitle = "using Root Mean Squared Error (RMSE) to compare",
+         caption = "Best model displayed in Red                                                                                         Data source: Inspectorate of Education") + #nolint
+    coord_flip(ylim = c(0, 15)) +
+    theme_minimal() +
+    scale_fill_manual(values = c("black", "Red")) +
+    geom_text(aes(label = round(RMSE, 3)), hjust = -0.5)
+
+
+```
+
+From this we can conclude that the best model to predict future data is the linear model using forward stepwise selection.
+
+## Bonus
+
+To answer another question that came up: How far ahead can we predict, using these models.
+
+We will be answering this question by looking if our best performing model (approach) can be used to predict data 2 years ahead, instead of 1 year only.
+We first make new training data - using the same approach as before, but now for 2016-2017.
+```{r}
+# now add some more data:
+train_data2 <- d_personeel_tot %>%
+  filter(schooljaar == "2016-2017") %>%
+  right_join(tmp_file, by = c("brin_nummer"))
+
+# now add some more data:
+train_data2 <- d_weging %>%
+  filter(schooljaar == "2016-2017") %>%
+  right_join(tmp_file, by = c("brin_nummer", "vestigingsnummer"))
+
+train_data2 <- d_weging %>%
+  rename("schoolweging_2015_2016" = "schoolweging") %>%
+  filter(schooljaar == "2016-2017") %>%
+  right_join(tmp_file, by = c("brin_nummer", "vestigingsnummer")) %>%
+  rename("schoolweging_2016_2017" = "schoolweging")
+
+# missing data issues..
+clean_train_data2 <- train_data2 %>%
+  filter(!is.na(`2015-2016`),
+         !is.na(`2016-2017`),
+         !is.na(schoolweging_2015_2016),
+         !is.na(schoolweging_2016_2017))
+
+mod <- lm(`2015-2016` ~ 1 + schoolweging_2015_2016, data = clean_train_data2)
+clean_train_data2$res_2015_2016 <- residuals(mod)
+
+mod <- lm(`2016-2017` ~ 1 + schoolweging_2016_2017, data = clean_train_data2)
+clean_train_data2$res_2016_2017 <- residuals(mod)
+
+clean_train_data2$diff_corrected_1 <- clean_train_data2$res_2016_2017 -
+  clean_train_data2$res_2015_2016
+
+df_train2 <- clean_train_data2 %>%
+  select(brin_nummer, vestigingsnummer, `2015-2016`, `2016-2017`, `2017-2018`,
+         `2018-2019`, diff1, diff2, diff3, res_2015_2016, res_2016_2017,
+         diff_corrected_1)
+
+train_tot2 <- d_tot %>%
+  filter(schooljaar == "2016-2017") %>%
+  left_join(df_train2, by = c("brin_nummer", "vestigingsnummer")) %>%
+  mutate(aantal_leerlingen = as.numeric(aantal_leerlingen))
+
+train_tot2 <- train_tot2[complete.cases(train_tot2), ]
+
+train_tot2 <- train_tot2  %>%
+  rename("y2015_2016" = "2015-2016",
+         "y2016_2017" = "2016-2017",
+         "y2017_2018" = "2017-2018",
+         "y2018_2019" = "2018-2019") %>%
+  mutate_if(is.numeric, ~ifelse(abs(.) == Inf, 0, .)) %>%
+  mutate_if(is.numeric, ~ifelse(abs(.) == -Inf, 0, .))
+
+train_model2 <- train_tot2 %>%
+  select(-c(brin_nummer, vestigingsnummer, schooljaar, postcode,
+            plaatsnaam, gemeentenaam, provincie, jaar, gemeentenummer,
+            diff2, diff3, diff1,
+            # remove variables with high correlation
+            perc_2F, y2015_2016,
+            # these predictors make the r-squared 1
+            y2017_2018, y2018_2019, y2016_2017,
+            res_2015_2016, res_2016_2017))
+
+colnames(train_model2)
+```
+
+We Use this model to train a new linear model.
+```{r}
+nullmod2 <- lm(diff_corrected_1 ~ 1, data = train_model2)
+fullmod2 <- lm(diff_corrected_1 ~., data = train_model2)
+summary(fullmod2)
+
+finalmod2 <- MASS::stepAIC(nullmod2,
+                              scope = list(upper = fullmod2),
+                              direction = "forward", trace = FALSE)
+
+finalmod2
+summary(finalmod2)
+```
+
+As we can see this model - with a R-squared of .29 - explains a lot less variance in the outcome variable than the previous model - with a R-squared of .55. A possible explanation for this is the fact that the first model used the difference score of the previous year as one of its predictor variables, something that cannot be used for this model using the first possible difference score.
+
+We will now try to predict the scores 2 years later, using this model.
+```{r}
+pred_lm2 <- predict(finalmod2, newdata = test_model)
+
+RMSE_lm2 <- RMSE(pred = pred_lm2, obs = test_model$diff_corrected_3)
+RMSE_lm2
+
+tibble(pred_lm = pred_lm2, diff_corrected_3 = test_model$diff_corrected_3) %>%
+  ggplot(aes(x = pred_lm, y = diff_corrected_3)) +
+  geom_point(alpha = .2) +
+  geom_abline() +
+  labs(title = "Predictions vs Observations", y = "Corrected Difference of
+       Observations (2018/2019 - 2017/2018)", x = "LM Predictions",
+       subtitle = "Using data to predict 2 years into the future",
+       caption = "Data Source: Inspectorate of Education") +
+  theme_minimal() +
+  geom_text(x = 30, y = -30, size = 4,
+    label = paste("RMSE = ", round(RMSE_lm2, 3)))
+```
+
+As we can see the RMSE is quite a bit lower for data predicted two years ahead. It scored just above the decision tree (which used a categorical classification model, so it is natural that it performs worse than a continuous prediction model).
+
+### Checking code style
+
+```{r}
+lintr::lint(filename = rstudioapi::getSourceEditorContext()$path)
+```
+
